@@ -207,6 +207,25 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
   return status;
 }
 
+/* ⚠⚠ bidirectionalAudio_enabled has a consequence that is easy to miss:
+ *
+ *   It adds SMBF_WRITE_REPLACE, and dub_speech_frame() then replaces EVERY
+ *   outgoing frame — filling with zeroes whenever our playout buffer is empty
+ *   (lws_glue.cpp). So from the moment it is enabled, the caller hears ONLY
+ *   what the WebSocket server sends: any dialplan playback(), any bridged
+ *   audio, any moh is silenced for the rest of the call.
+ *
+ *   That is intentional — mixing half-spoken TTS with whatever else is on the
+ *   channel is worse — but it makes `true` here a much bigger switch than the
+ *   name suggests. See the README section "Bidirectional audio takes over the
+ *   channel".
+ *
+ * ★ The converse also bites: WRITE_REPLACE only fires while something is
+ *   actually writing to the channel. On an idle or parked leg nothing writes,
+ *   dub_speech_frame is never called, and the playout buffer fills without ever
+ *   draining. If you are testing playback, give the leg a writer — e.g.
+ *   playback(silence_stream://3600000,0).
+ */
 #define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | stop_play | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled] [bidirectionalAudio_stream_enabled] [bidirectionalAudio_stream_samplerate]"
 SWITCH_STANDARD_API(fork_function)
 {

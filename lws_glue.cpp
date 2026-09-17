@@ -168,14 +168,21 @@ namespace {
             const int16_t* samples = reinterpret_cast<const int16_t*>(rawAudio.data());
             size_t numSamples = rawAudio.size() / sizeof(int16_t);
 
+            /* ★ Snapshot the sizes INSIDE the lock. The log line below used to
+             *   call buf->size() / buf->capacity() after unlocking, racing with
+             *   dub_speech_frame's erase_begin() on the media thread — a data
+             *   race for a debug message. */
+            size_t bufSize = 0, bufCap = 0;
             switch_mutex_lock(tech_pvt->mutex);
             PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
             buf->insert(buf->end(), samples, samples + numSamples);
+            bufSize = buf->size();
+            bufCap = buf->capacity();
             switch_mutex_unlock(tech_pvt->mutex);
 
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
               "(%u) processIncomingMessage - buffered %zu samples (playout size now %zu/%zu)\n",
-              tech_pvt->id, numSamples, buf->size(), buf->capacity());
+              tech_pvt->id, numSamples, bufSize, bufCap);
           }
           tech_pvt->responseHandler(session, EVENT_PLAY_AUDIO, NULL);
         }
@@ -943,10 +950,23 @@ extern "C" {
             }
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
               tech_pvt->id);
-            pAudioPipe->binaryWritePtrResetToZero();
+            pAudioPipe->binaryWritePtrReset();
 
-            frame.data = pAudioPipe->binaryWritePtr();
-            frame.buflen = available = pAudioPipe->binarySpaceAvailable();
+            /* ★★★ Stop draining for this tick — the resampling branch below
+             *   already does exactly this on the same condition, and this one
+             *   did not.
+             *
+             * ⚠ The loop's ONLY other exit is switch_core_media_bug_read()
+             *   returning non-SUCCESS. Without this break, an overrun left us
+             *   spinning here refilling a buffer the lws thread has not drained,
+             *   discarding audio each lap — on the audio thread, inside the
+             *   session mutex. Two branches, one condition, opposite handling:
+             *   whichever was right, they could not both be.
+             *
+             * ★ Nothing is lost by stopping: the backlog stays in the bug's
+             *   buffer and is read on the next callback 20ms later, by which
+             *   time lws has usually drained. */
+            break;
           }
 
           switch_status_t rv = switch_core_media_bug_read(bug, &frame, SWITCH_TRUE);

@@ -68,8 +68,25 @@ public:
   void binaryWritePtrAdd(size_t len) {
     m_audio_buffer_write_offset += len;
   }
-  void binaryWritePtrResetToZero(void) {
-    m_audio_buffer_write_offset = 0;
+  /* ★★★ Resets to LWS_PRE, not to 0.
+   *
+   * Every other site treats LWS_PRE as the base of the audio region: the
+   * constructor initialises the offset to it (audio_pipe.cpp), the send path
+   * reads `m_audio_buffer + LWS_PRE` for `offset - LWS_PRE` bytes, and
+   * unlockAudioBuffer() tests `offset > LWS_PRE` to decide there is anything
+   * to send. lws needs those LWS_PRE bytes in front of the payload — it writes
+   * the frame header into them.
+   *
+   * ⚠ Resetting to 0 put audio where the header goes. After an overrun the
+   *   next lws_write() sent bytes [LWS_PRE, offset) — dropping the first
+   *   LWS_PRE bytes of audio — and then scribbled the header over [0, LWS_PRE),
+   *   which was freshly written audio. Silent corruption, only after
+   *   "dropping packets!" has already fired, which is why it never got noticed.
+   *
+   * ★ Renamed from binaryWritePtrResetToZero: the old name asserted the bug.
+   */
+  void binaryWritePtrReset(void) {
+    m_audio_buffer_write_offset = LWS_PRE;
   }
   void lockAudioBuffer(void) {
     m_audio_mutex.lock();

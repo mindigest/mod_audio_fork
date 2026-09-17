@@ -66,6 +66,29 @@ uuid_audio_fork <uuid> stop <metadata>
 ```
 Closes websocket connection and detaches media bug, optionally sending a final text frame over the websocket connection before closing.
 
+### Bidirectional audio takes over the channel
+
+Passing `true` for `bidirectionalAudio_enabled` is a bigger switch than the name
+suggests, in both directions.
+
+**It silences everything else on the channel.** The flag adds
+`SMBF_WRITE_REPLACE`, and `dub_speech_frame()` then replaces *every* outgoing
+frame — filling with zeroes whenever the playout buffer is empty. From that
+moment the caller hears only what your WebSocket server sends: dialplan
+`playback()`, bridged audio and music-on-hold are all gone for the rest of the
+call. This is deliberate (mixing half-spoken TTS with whatever else is on the
+channel is worse), but it is not obvious from the parameter name.
+
+**It only works on a leg that something is writing to.** `WRITE_REPLACE` fires
+from `switch_core_session_write_frame()`. On an idle or parked leg nothing
+writes, so `dub_speech_frame()` is never called and the playout buffer fills
+without ever draining — the symptom is "I send `playAudio`, the buffer grows,
+the caller hears nothing". If you are testing playback, give the leg a writer:
+
+```xml
+<action application="playback" data="silence_stream://3600000,0"/>
+```
+
 ### Events
 An optional feature of this module is that it can receive JSON text frames from the server and generate associated events to an application.  The format of the JSON text frames and the associated events are described below.
 

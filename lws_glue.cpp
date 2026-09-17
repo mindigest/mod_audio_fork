@@ -21,6 +21,7 @@
 #include "mod_audio_fork.h"
 #include "ws_uri.hpp"
 #include "drop_throttle.hpp"
+#include "media_fill.hpp"
 #include "json_escape.hpp"
 #include <inttypes.h>
 
@@ -28,6 +29,11 @@
  *   Counted in frames rather than milliseconds so the audio path needs no
  *   clock syscall — see the else-branch in fork_frame. */
 #define FRAME_DROP_REPORT_EVERY 500
+
+/* ★ How many CONSECUTIVE fill frames before saying so. 250 ≈ 5s at 50 frames/s.
+ *   Short enough to catch a dead call while it is still up, long enough that a
+ *   working call's start-up gap (measured: 4 frames) never trips it. */
+#define MEDIA_FILL_REPORT_EVERY 250
 #include "audio_pipe.hpp"
 
 #define RTP_PACKETIZATION_PERIOD 20
@@ -162,14 +168,21 @@ namespace {
             const int16_t* samples = reinterpret_cast<const int16_t*>(rawAudio.data());
             size_t numSamples = rawAudio.size() / sizeof(int16_t);
 
+            /* ★ Snapshot the sizes INSIDE the lock. The log line below used to
+             *   call buf->size() / buf->capacity() after unlocking, racing with
+             *   dub_speech_frame's erase_begin() on the media thread — a data
+             *   race for a debug message. */
+            size_t bufSize = 0, bufCap = 0;
             switch_mutex_lock(tech_pvt->mutex);
             PlayoutBuffer* buf = static_cast<PlayoutBuffer*>(tech_pvt->playoutBuffer);
             buf->insert(buf->end(), samples, samples + numSamples);
+            bufSize = buf->size();
+            bufCap = buf->capacity();
             switch_mutex_unlock(tech_pvt->mutex);
 
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
               "(%u) processIncomingMessage - buffered %zu samples (playout size now %zu/%zu)\n",
-              tech_pvt->id, numSamples, buf->size(), buf->capacity());
+              tech_pvt->id, numSamples, bufSize, bufCap);
           }
           tech_pvt->responseHandler(session, EVENT_PLAY_AUDIO, NULL);
         }
@@ -328,6 +341,93 @@ namespace {
     switch_mutex_unlock(tech_pvt->mutex);
   }
 
+  /* noteFillFrame records one inbound frame and reports a sustained run of
+   * FreeSWITCH no-media fill.
+   *
+   * ★★★ The frame is still forwarded either way. The fill is not wrong — a
+   *   media path must produce a frame every 20ms whether or not anything
+   *   arrived — and dropping it here would turn a diagnosable problem into a
+   *   stream with holes in it. What was missing is the label, so that is all
+   *   this adds. See media_fill.hpp for why the label cannot come from
+   *   FreeSWITCH itself (SFF_CNG is lost on the way into the bug buffer).
+   *
+   * ★ Called on the audio path, so: no clock syscall, no allocation, and the
+   *   throttle counts frames. Same constraints as the PR-2 drop counter, and it
+   *   reuses that counter's arithmetic rather than open-coding a second copy.
+   */
+  void noteFillFrame(switch_core_session_t* session, private_t* tech_pvt, int isFill) {
+    if (!tech_pvt) return;
+    if (!isFill) {
+      /* ★ Reset the report marker too, not just the run. Otherwise a second
+       *   outage in the same call stays silent until it exceeds the first. */
+      tech_pvt->fillFramesConsecutive = 0;
+      tech_pvt->lastFillReportedAt = 0;
+      return;
+    }
+    tech_pvt->fillFramesTotal++;
+    tech_pvt->fillFramesConsecutive++;
+    if (!mod_af_should_report_drop(tech_pvt->fillFramesConsecutive,
+                                   tech_pvt->lastFillReportedAt,
+                                   tech_pvt->fillReportEvery,
+                                   MEDIA_FILL_REPORT_EVERY)) {
+      return;
+    }
+    tech_pvt->lastFillReportedAt = tech_pvt->fillFramesConsecutive;
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+      "{\"consecutive_fill_frames\":%" PRIu64 ",\"consecutive_ms\":%" PRIu64
+      ",\"total_fill_frames\":%" PRIu64 "}",
+      tech_pvt->fillFramesConsecutive,
+      tech_pvt->fillFramesConsecutive * RTP_PACKETIZATION_PERIOD,
+      tech_pvt->fillFramesTotal);
+    tech_pvt->responseHandler(session, EVENT_MEDIA_SILENT, buf);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+      "(%u) mod_audio_fork: inbound is FreeSWITCH no-media fill, not audio "
+      "(%" PRIu64 " consecutive frames = %" PRIu64 "ms)\n",
+      tech_pvt->id, tech_pvt->fillFramesConsecutive,
+      tech_pvt->fillFramesConsecutive * RTP_PACKETIZATION_PERIOD);
+  }
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * tech_pvt->pAudioPipe must only be touched under tech_pvt->mutex
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * The pointer is written on the **lws service thread** (the three cases in
+   * eventCallback below) and read + dereferenced on the **FreeSWITCH media
+   * thread** (fork_frame). Worse, the object itself is deleted on the lws
+   * thread immediately after the callback returns — audio_pipe.cpp,
+   * LWS_CALLBACK_CLIENT_CLOSED:
+   *
+   *     *ppAp = NULL;
+   *     delete ap;
+   *
+   * ⚠ So the media thread could be holding a pointer that the lws thread is
+   *   about to free: it loads tech_pvt->pAudioPipe, and between that load and
+   *   pAudioPipe->lockAudioBuffer() the object goes away. Use-after-free.
+   *
+   * ★ Nulling the pointer under the same mutex fork_frame uses closes it:
+   *   a media thread that already holds the mutex finishes first, and one that
+   *   acquires it afterwards sees nullptr. Since `delete ap` happens *after*
+   *   m_callback() returns, by then nobody can be inside.
+   *
+   * ★★ Lock order is safe. Everything that takes tech_pvt->mutex may then take
+   *   an AudioPipe-internal lock (m_text_mutex / m_audio_mutex), never the
+   *   reverse: the lws thread releases mutex_connects/writes/disconnects before
+   *   invoking any callback, and AudioPipe::close() / bufferForSending() are
+   *   non-blocking (they only queue and lws_cancel_service). Verified by
+   *   reading every lock site, not by assumption — a blocking close() here
+   *   would deadlock against an lws thread waiting on tech_pvt->mutex.
+   */
+  void clearAudioPipe(private_t* tech_pvt) {
+    if (!tech_pvt || !tech_pvt->mutex) {
+      if (tech_pvt) tech_pvt->pAudioPipe = nullptr;
+      return;
+    }
+    switch_mutex_lock(tech_pvt->mutex);
+    tech_pvt->pAudioPipe = nullptr;
+    switch_mutex_unlock(tech_pvt->mutex);
+  }
+
   static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event,
                             const char* message, const char* binary, size_t binary_len) {
     switch_core_session_t* session = switch_core_session_locate(sessionId);
@@ -343,8 +443,13 @@ namespace {
               tech_pvt->responseHandler(session, EVENT_CONNECT_SUCCESS, NULL);
               if (strlen(tech_pvt->initialMetadata) > 0) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "sending initial metadata %s\n", tech_pvt->initialMetadata);
+                /* ★ Under the mutex, and null-checked. This was an unchecked
+                 *   dereference: on the CONNECT_SUCCESS → (racing) teardown
+                 *   ordering, pAudioPipe can already be nullptr here. */
+                switch_mutex_lock(tech_pvt->mutex);
                 AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
-                pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                if (pAudioPipe) pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                switch_mutex_unlock(tech_pvt->mutex);
               }
             break;
             case AudioPipe::CONNECT_FAIL:
@@ -352,20 +457,20 @@ namespace {
               // first thing: we can no longer access the AudioPipe
               std::stringstream json;
               json << "{\"reason\":\"" << message << "\"}";
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               tech_pvt->responseHandler(session, EVENT_CONNECT_FAIL, (char *) json.str().c_str());
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "connection failed: %s\n", message);
             }
             break;
             case AudioPipe::CONNECTION_DROPPED:
               // first thing: we can no longer access the AudioPipe
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               tech_pvt->responseHandler(session, EVENT_DISCONNECT, NULL);
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "connection dropped from far end\n");
             break;
             case AudioPipe::CONNECTION_CLOSED_GRACEFULLY:
               // first thing: we can no longer access the AudioPipe
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "connection closed gracefully\n");
             break;
             case AudioPipe::MESSAGE:
@@ -421,6 +526,17 @@ namespace {
         if (n > 0) tech_pvt->dropReportEvery = (uint64_t) n;
         else switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
           "MOD_AUDIO_FORK_DROP_REPORT_EVERY=%s ignored (must be > 0)\n", v);
+      }
+    }
+    tech_pvt->fillReportEvery = MEDIA_FILL_REPORT_EVERY;
+    {
+      const char *v = switch_channel_get_variable(
+        switch_core_session_get_channel(session), "MOD_AUDIO_FORK_FILL_REPORT_EVERY");
+      if (v) {
+        long n = atol(v);
+        if (n > 0) tech_pvt->fillReportEvery = (uint64_t) n;
+        else switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+          "MOD_AUDIO_FORK_FILL_REPORT_EVERY=%s ignored (must be > 0)\n", v);
       }
     }
     tech_pvt->audio_paused = 0;
@@ -665,9 +781,16 @@ extern "C" {
 
    switch_status_t fork_session_connect(void **ppUserData) {
     private_t *tech_pvt = static_cast<private_t *>(*ppUserData);
+    if (!tech_pvt) return SWITCH_STATUS_FALSE;
+    /* ★ Was an unchecked dereference: `static_cast<AudioPipe*>(...)->connect()`
+     *   with no null test at all. It happens to be non-null today because the
+     *   caller runs right after fork_session_init — but "happens to be" is not
+     *   a guarantee, and this is the one place a failed init would land. */
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe*>(tech_pvt->pAudioPipe);
-    pAudioPipe->connect();
-    return SWITCH_STATUS_SUCCESS;
+    if (pAudioPipe) pAudioPipe->connect();
+    switch_mutex_unlock(tech_pvt->mutex);
+    return pAudioPipe ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
   }
 
   switch_status_t fork_session_cleanup(switch_core_session_t *session, char *bugname, char* text, int channelIsClosing) {
@@ -686,9 +809,11 @@ extern "C" {
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) fork_session_cleanup\n", id);
 
-    AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
-
     switch_mutex_lock(tech_pvt->mutex);
+    /* ★ Read INSIDE the lock. This used to sit above the lock, so cleanup could
+     *   load a pointer that the lws thread deleted a moment later — the same
+     *   window fork_frame has, just on a different thread. */
+    AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
 
     // get the bug again, now that we are under lock
     {
@@ -731,8 +856,12 @@ extern "C" {
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
   
     if (!tech_pvt) return SWITCH_STATUS_FALSE;
+    /* ★ Use it under the lock, do not just read it under the lock: the object
+     *   can be deleted on the lws thread the instant we let go. */
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
+    switch_mutex_unlock(tech_pvt->mutex);
 
     return SWITCH_STATUS_SUCCESS;
   }
@@ -780,8 +909,10 @@ extern "C" {
 
     tech_pvt->graceful_shutdown = 1;
 
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
     if (pAudioPipe) pAudioPipe->do_graceful_shutdown();
+    switch_mutex_unlock(tech_pvt->mutex);
 
     return SWITCH_STATUS_SUCCESS;
   }
@@ -819,15 +950,31 @@ extern "C" {
             }
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
               tech_pvt->id);
-            pAudioPipe->binaryWritePtrResetToZero();
+            pAudioPipe->binaryWritePtrReset();
 
-            frame.data = pAudioPipe->binaryWritePtr();
-            frame.buflen = available = pAudioPipe->binarySpaceAvailable();
+            /* ★★★ Stop draining for this tick — the resampling branch below
+             *   already does exactly this on the same condition, and this one
+             *   did not.
+             *
+             * ⚠ The loop's ONLY other exit is switch_core_media_bug_read()
+             *   returning non-SUCCESS. Without this break, an overrun left us
+             *   spinning here refilling a buffer the lws thread has not drained,
+             *   discarding audio each lap — on the audio thread, inside the
+             *   session mutex. Two branches, one condition, opposite handling:
+             *   whichever was right, they could not both be.
+             *
+             * ★ Nothing is lost by stopping: the backlog stays in the bug's
+             *   buffer and is read on the next callback 20ms later, by which
+             *   time lws has usually drained. */
+            break;
           }
 
           switch_status_t rv = switch_core_media_bug_read(bug, &frame, SWITCH_TRUE);
           if (rv != SWITCH_STATUS_SUCCESS) break;
           if (frame.datalen) {
+            /* ★ Inspect BEFORE binaryWritePtrAdd: frame.data still points at the
+             *   bytes we just read, and after the add the pointer has moved on. */
+            noteFillFrame(session, tech_pvt, mod_af_frame_is_fill(frame.data, frame.datalen));
             pAudioPipe->binaryWritePtrAdd(frame.datalen);
             frame.buflen = available = pAudioPipe->binarySpaceAvailable();
             frame.data = pAudioPipe->binaryWritePtr();
@@ -842,6 +989,9 @@ extern "C" {
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
           if (frame.datalen) {
+            /* ★ Judge the frame as it arrived, before resampling: the resampler
+             *   would smear 0xFF into values that are merely close to it. */
+            noteFillFrame(session, tech_pvt, mod_af_frame_is_fill(frame.data, frame.datalen));
             spx_uint32_t out_len = available >> 1;  // space for samples which are 2 bytes
             spx_uint32_t in_len = frame.samples;
 

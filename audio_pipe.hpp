@@ -3,6 +3,7 @@
 
 #include <string>
 #include <list>
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
@@ -53,7 +54,7 @@ public:
     bool bidirectional_audio_stream, notifyHandler_t callback);
   ~AudioPipe();  
 
-  LwsState_t getLwsState(void) { return m_state; }
+  LwsState_t getLwsState(void) { return m_state.load(std::memory_order_acquire); }
   void connect(void);
   void bufferForSending(const char* text);
   size_t binarySpaceAvailable(void) {
@@ -68,8 +69,25 @@ public:
   void binaryWritePtrAdd(size_t len) {
     m_audio_buffer_write_offset += len;
   }
-  void binaryWritePtrResetToZero(void) {
-    m_audio_buffer_write_offset = 0;
+  /* ★★★ Resets to LWS_PRE, not to 0.
+   *
+   * Every other site treats LWS_PRE as the base of the audio region: the
+   * constructor initialises the offset to it (audio_pipe.cpp), the send path
+   * reads `m_audio_buffer + LWS_PRE` for `offset - LWS_PRE` bytes, and
+   * unlockAudioBuffer() tests `offset > LWS_PRE` to decide there is anything
+   * to send. lws needs those LWS_PRE bytes in front of the payload — it writes
+   * the frame header into them.
+   *
+   * ⚠ Resetting to 0 put audio where the header goes. After an overrun the
+   *   next lws_write() sent bytes [LWS_PRE, offset) — dropping the first
+   *   LWS_PRE bytes of audio — and then scribbled the header over [0, LWS_PRE),
+   *   which was freshly written audio. Silent corruption, only after
+   *   "dropping packets!" has already fired, which is why it never got noticed.
+   *
+   * ★ Renamed from binaryWritePtrResetToZero: the old name asserted the bug.
+   */
+  void binaryWritePtrReset(void) {
+    m_audio_buffer_write_offset = LWS_PRE;
   }
   void lockAudioBuffer(void) {
     m_audio_mutex.lock();
@@ -130,7 +148,14 @@ private:
   
   bool connect_client(struct lws_per_vhost_data *vhd);
 
-  LwsState_t m_state;
+  /* ★★★ Written on the lws service thread (connect / established / closed) and
+   *   read on the FreeSWITCH media thread via getLwsState(), which fork_frame
+   *   calls on every 20ms frame. It was a plain enum: a torn or stale read here
+   *   decides whether we write into a pipe that is no longer connected.
+   *   ⚠ Atomic is the floor, not a fix for the check-then-act that follows it —
+   *   fork_frame takes tech_pvt->mutex around that sequence, which is what
+   *   actually makes it safe. */
+  std::atomic<LwsState_t> m_state;
   std::string m_uuid;
   std::string m_host;
   std::string m_bugname;

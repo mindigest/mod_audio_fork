@@ -66,6 +66,29 @@ uuid_audio_fork <uuid> stop <metadata>
 ```
 Closes websocket connection and detaches media bug, optionally sending a final text frame over the websocket connection before closing.
 
+### Bidirectional audio takes over the channel
+
+Passing `true` for `bidirectionalAudio_enabled` is a bigger switch than the name
+suggests, in both directions.
+
+**It silences everything else on the channel.** The flag adds
+`SMBF_WRITE_REPLACE`, and `dub_speech_frame()` then replaces *every* outgoing
+frame — filling with zeroes whenever the playout buffer is empty. From that
+moment the caller hears only what your WebSocket server sends: dialplan
+`playback()`, bridged audio and music-on-hold are all gone for the rest of the
+call. This is deliberate (mixing half-spoken TTS with whatever else is on the
+channel is worse), but it is not obvious from the parameter name.
+
+**It only works on a leg that something is writing to.** `WRITE_REPLACE` fires
+from `switch_core_session_write_frame()`. On an idle or parked leg nothing
+writes, so `dub_speech_frame()` is never called and the playout buffer fills
+without ever draining — the symptom is "I send `playAudio`, the buffer grows,
+the caller hears nothing". If you are testing playback, give the leg a writer:
+
+```xml
+<action application="playback" data="silence_stream://3600000,0"/>
+```
+
 ### Events
 An optional feature of this module is that it can receive JSON text frames from the server and generate associated events to an application.  The format of the JSON text frames and the associated events are described below.
 
@@ -177,6 +200,69 @@ The error data can be any JSON object and is left for the application to the app
 ##### Freeswitch event generated
 **Name**: mod_audio_fork::error
 **Body**: JSON string - the data attribute from the server message
+
+#### Module-originated events
+
+The events above are all *responses* — the server sends a JSON message and the
+module raises a FreeSWITCH event. The two below have **no server message**: the
+module raises them on its own when it notices something the caller cannot see
+from the outside. Both are throttled (they describe conditions that, once true,
+tend to stay true for thousands of frames).
+
+Negotiate on the capability bits from `audio_fork_version` rather than on the
+module version — see [Capabilities](#capabilities).
+
+##### mod_audio_fork::media_silent
+
+Capability bit: `media_silent` (0.3.0+)
+
+The inbound stream is FreeSWITCH's no-media fill, not audio. FreeSWITCH does
+not hand us silence and does not hand us an error — it hands us a frame
+`memset` to `0xFF`, and the frame carries `SFF_CNG`, so FS *knows* it is not
+audio. Without this event the condition is invisible from outside: the call
+answers, the CDR bills, and the transcript is simply empty.
+
+```json
+{"consecutive_fill_frames":150,"consecutive_ms":3000,"total_fill_frames":150}
+```
+
+★ `consecutive_*` reset when real audio resumes; `total_fill_frames` does not.
+A call that ends with a large `total` and a small `consecutive` had gaps; one
+where they are equal and large never received anything at all.
+
+##### mod_audio_fork::frame_dropped
+
+Capability bit: `frame_drop_metrics` (0.2.0+)
+
+A frame was skipped because `trylock` on the write path lost. Counted rather
+than logged-and-forgotten so that "we dropped audio" stops being invisible.
+
+```json
+{"frames_dropped_total":3,"reason":"trylock"}
+```
+
+## Capabilities
+
+`audio_fork_version` returns the module's identity as one line of JSON, so a
+consumer can negotiate instead of assuming:
+
+```console
+$ fs_cli -x 'audio_fork_version'
+{"module":"mod_audio_fork","version":"0.3.0","capabilities":{"frame_drop_metrics":true,"media_silent":true,"lockfree_writes":false,"multithread_safe":false},"service_threads":1,"subprotocol":"audio.drachtio.org"}
+```
+
+★★★ **Ask for the bit, not the version.** The version string is bumped by hand
+at release time; between releases several commits can share one version. In
+0.2.0 that is exactly what happened — five commits, including a
+use-after-destroy mutex and three data races, all reporting `"0.2.0"` — and a
+deployment running the pre-fix build was indistinguishable from one running the
+fixes. The bits move with the feature; the string moves with the release.
+
+★★ A bit reported `false` is the honest answer for a feature that is not
+built. `lockfree_writes` and `multithread_safe` are hard-wired to 0 and stay
+declared on purpose: they are the negotiation surface for the day someone needs
+to scale up. **A bit that lies is worse than a bit that is absent** — a
+consumer that sees a stale `true` skips a workaround it still needs.
 
 ## Tests
 

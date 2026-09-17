@@ -1,6 +1,8 @@
 #include "audio_pipe.hpp"
 
 #include <cassert>
+#include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -212,8 +214,18 @@ int AudioPipe::lws_callback(struct lws *wsi,
 
         // check for graceful close - send a zero length binary frame
         if (ap->isGracefulShutdown()) {
-          lwsl_notice("%s graceful shutdown - sending zero length binary frame to flush any final responses\n", ap->m_uuid.c_str());
           std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
+          /* ⚠ Anything still buffered is discarded here — the zero-length frame
+           *   is the shutdown marker, so we cannot send audio after it and this
+           *   returns without draining. Say how much rather than losing it
+           *   silently; the tail of the last utterance is exactly what a
+           *   transcript would be missing. */
+          if (ap->m_audio_buffer_write_offset > LWS_PRE) {
+            lwsl_warn("%s graceful shutdown - discarding %lu buffered audio bytes\n",
+              ap->m_uuid.c_str(),
+              (unsigned long) (ap->m_audio_buffer_write_offset - LWS_PRE));
+          }
+          lwsl_notice("%s graceful shutdown - sending zero length binary frame to flush any final responses\n", ap->m_uuid.c_str());
           lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, 0, LWS_WRITE_BINARY);
           return 0;
         }
@@ -252,11 +264,48 @@ int AudioPipe::lws_callback(struct lws *wsi,
           if (ap->m_audio_buffer_write_offset > LWS_PRE) {
             size_t datalen = ap->m_audio_buffer_write_offset - LWS_PRE;
             int sent = lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, datalen, LWS_WRITE_BINARY);
-            if (sent < 0 || (size_t)sent < datalen) {
-              lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s attempted to send %lu only sent %d wsi %p..\n",
-                ap->m_uuid.c_str(), datalen, sent, wsi);
+            if (sent < 0) {
+              /* ⚠ A hard write error. The connection is going away; there is
+               * nothing useful to keep, so drop the buffer — but say how much. */
+              lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s write failed (%d), discarding %lu bytes wsi %p..\n",
+                ap->m_uuid.c_str(), sent, (unsigned long) datalen, wsi);
+              ap->m_audio_buffer_write_offset = LWS_PRE;
             }
-            ap->m_audio_buffer_write_offset = LWS_PRE;
+            else if ((size_t)sent < datalen) {
+              /* ════════════════════════════════════════════════════════════
+               * ★★★ Short write: KEEP the tail, do not throw it away
+               * ════════════════════════════════════════════════════════════
+               *
+               * This used to reset the cursor unconditionally, so whatever lws
+               * had not accepted was silently dropped — one lwsl_err and gone.
+               * ⚠ lws logs default to ERR|WARN|NOTICE, so that line lands in
+               *   the middle of everything else and nothing counts it.
+               *
+               * Audio is a stream: dropping the tail of a frame does not lose
+               * "a bit of quality", it desynchronises everything after it for
+               * any consumer doing framing (which is every ASR).
+               *
+               * ★ Move the remainder back to the start of the audio region and
+               *   ask for another writeable callback. Same buffer, no
+               *   allocation; memmove because the ranges overlap.
+               */
+              size_t remaining = datalen - (size_t) sent;
+              memmove((unsigned char *) ap->m_audio_buffer + LWS_PRE,
+                      (unsigned char *) ap->m_audio_buffer + LWS_PRE + sent,
+                      remaining);
+              ap->m_audio_buffer_write_offset = LWS_PRE + remaining;
+              lwsl_warn("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s short write: sent %d of %lu, %lu bytes requeued wsi %p..\n",
+                ap->m_uuid.c_str(), sent, (unsigned long) datalen, (unsigned long) remaining, wsi);
+              lws_callback_on_writable(wsi);
+            }
+            else {
+              /* ★ No re-arm needed on the full-write path: we hold m_audio_mutex
+               *   for this whole block, so the media thread cannot have appended
+               *   anything meanwhile, and its next unlockAudioBuffer() calls
+               *   addPendingWrite() when it does. (The metadata branch above
+               *   re-arms because it returns early with audio possibly pending.) */
+              ap->m_audio_buffer_write_offset = LWS_PRE;
+            }
           }
         }
 
@@ -518,7 +567,10 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_sslFlags(sslFlags), m_wsi(nullptr),
   m_audio_buffer_max_len(bufLen), m_audio_buffer_write_offset(LWS_PRE),
   m_audio_buffer_min_freespace(minFreespace),
-  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
+  /* ★ m_recv_buf_len was missing from this list: an uninitialised size next to
+   *   a null pointer. The receive path happens to set it before first use, but
+   *   "happens to" is what the rest of this list exists to avoid. */
+  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr), m_recv_buf_len(0),
   m_vhd(nullptr), m_callback(callback),
   m_gracefulShutdown(false), m_bidirectional_audio_stream(bidirectional_audio_stream) {
 
@@ -530,8 +582,12 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
 }
 AudioPipe::~AudioPipe() {
-  if (m_audio_buffer) delete [] m_audio_buffer;
-  if (m_recv_buf) delete [] m_recv_buf;
+  if (m_audio_buffer) delete [] m_audio_buffer;   /* new uint8_t[] above */
+  /* ★★★ free(), not delete[]. m_recv_buf is malloc'd (LWS_CALLBACK_CLIENT_RECEIVE),
+   *   grown with realloc() and released with free() everywhere else in this file.
+   *   Pairing it with delete[] here is undefined behaviour — it happens not to
+   *   crash on glibc, which is the only reason it has survived. */
+  if (m_recv_buf) free(m_recv_buf);
 }
 
 void AudioPipe::connect(void) {

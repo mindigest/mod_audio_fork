@@ -29,6 +29,7 @@ SWITCH_STANDARD_API(fork_version_function)
 		"{\"module\":\"mod_audio_fork\",\"version\":\"%s\","
 		"\"capabilities\":{"
 		"\"frame_drop_metrics\":%s,"
+		"\"media_silent\":%s,"
 		"\"lockfree_writes\":%s,"
 		"\"multithread_safe\":%s"
 		"},"
@@ -36,6 +37,7 @@ SWITCH_STANDARD_API(fork_version_function)
 		"\"subprotocol\":\"%s\"}\n",
 		MOD_AUDIO_FORK_VERSION,
 		CAP_FRAME_DROP_METRICS ? "true" : "false",
+		CAP_MEDIA_SILENT ? "true" : "false",
 		CAP_LOCKFREE_WRITES ? "true" : "false",
 		CAP_MULTITHREAD_SAFE ? "true" : "false",
 		fork_effective_threads(),
@@ -207,6 +209,25 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
   return status;
 }
 
+/* ⚠⚠ bidirectionalAudio_enabled has a consequence that is easy to miss:
+ *
+ *   It adds SMBF_WRITE_REPLACE, and dub_speech_frame() then replaces EVERY
+ *   outgoing frame — filling with zeroes whenever our playout buffer is empty
+ *   (lws_glue.cpp). So from the moment it is enabled, the caller hears ONLY
+ *   what the WebSocket server sends: any dialplan playback(), any bridged
+ *   audio, any moh is silenced for the rest of the call.
+ *
+ *   That is intentional — mixing half-spoken TTS with whatever else is on the
+ *   channel is worse — but it makes `true` here a much bigger switch than the
+ *   name suggests. See the README section "Bidirectional audio takes over the
+ *   channel".
+ *
+ * ★ The converse also bites: WRITE_REPLACE only fires while something is
+ *   actually writing to the channel. On an idle or parked leg nothing writes,
+ *   dub_speech_frame is never called, and the playout buffer fills without ever
+ *   draining. If you are testing playback, give the leg a writer — e.g.
+ *   playback(silence_stream://3600000,0).
+ */
 #define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | stop_play | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata] [bidirectionalAudio_enabled] [bidirectionalAudio_stream_enabled] [bidirectionalAudio_stream_samplerate]"
 SWITCH_STANDARD_API(fork_function)
 {
@@ -454,6 +475,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
     switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_FRAME_DROPPED) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_MEDIA_SILENT) != SWITCH_STATUS_SUCCESS ||
     /* ════════════════════════════════════════════════════════════════════
      * ★★★ PR-4: these four were DEFINED in the header and never reserved
      * ════════════════════════════════════════════════════════════════════
@@ -514,6 +536,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);
 	switch_event_free_subclass(EVENT_FRAME_DROPPED);
+	switch_event_free_subclass(EVENT_MEDIA_SILENT);
 	/* ★ 必须与 reserve 一一对应：漏 free 的症状是**在同一个进程里 reload 之后
 	 *   load 失败**（"module load file routine returned an error"），而那个报错
 	 *   不提事件子类。⚠ 实测撞到过一次，当时以为是 .so 坏了。 */

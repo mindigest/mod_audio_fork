@@ -254,8 +254,10 @@ COPIED_SIZE=$(docker exec "$FS_CONTAINER" stat -c%s "$MOD_PATH" 2>/dev/null || e
 #     slate is what a smoke test wants anyway.
 #
 # ★★ The real answer to "is FS running my build?" is the module reporting its
-#    own identity — that is PR-3 (`audio_fork_version`). Until it exists, the
-#    restart is what makes the question answerable at all.
+#    own identity — that is PR-3 (`audio_fork_version`). That now exists, and
+#    step 3b below asserts it against the version the SOURCE declares.
+#    The restart stays: the version string proves WHICH BUILD, not that FS
+#    reloaded it, and those are different claims.
 docker restart "$FS_CONTAINER" >/dev/null || fail "could not restart $FS_CONTAINER"
 for _ in $(seq 60); do
     STATE=$(docker inspect -f '{{.State.Health.Status}}' "$FS_CONTAINER" 2>/dev/null || echo "")
@@ -265,6 +267,61 @@ for _ in $(seq 60); do
     sleep 1
 done
 fs "status" | grep -q "^UP" || fail "$FS_CONTAINER did not come back up after restart"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3b. ★★★ Ask the module who it is, and hold it to what the source says.
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Why this is not redundant with the sha check below:
+#
+#   sha         proves the FILE on disk is the one we built
+#   restart     proves FS re-read that file
+#   THIS        proves the RUNNING CODE claims the version we think we shipped
+#
+# The third one is the only one a CONSUMER can make. tanxun-aicc's deploy runbook
+# says "tag is a label, not proof — ask the module itself", and it asks exactly
+# this API. So this assertion is the thing that keeps that runbook honest.
+#
+# ⚠ It caught a real state: 0.2.0..HEAD was five commits — a use-after-destroy
+#   mutex, three data races, and a new event — all reporting "0.2.0". Both of the
+#   consumer's environments ran the pre-fix build and *no command could tell*,
+#   because the only version-bearing string had not moved. A harness that builds
+#   the module and never asks its version cannot notice that.
+#
+# ★ Parsed out of the source, not hardcoded here: a literal in two places is a
+#   literal that will disagree, and the failure mode is a green test on a wrong
+#   version — the exact class of bug this block exists to catch.
+SRC_VERSION=$(sed -n 's/^#define MOD_AUDIO_FORK_VERSION "\(.*\)"/\1/p' "$REPO_ROOT/mod_audio_fork.h")
+[ -n "$SRC_VERSION" ] || fail "could not parse MOD_AUDIO_FORK_VERSION out of mod_audio_fork.h"
+
+VER_JSON=$(fs "audio_fork_version")
+echo "$VER_JSON" | grep -q '"module":"mod_audio_fork"' \
+    || fail "audio_fork_version did not answer as mod_audio_fork — got: $VER_JSON"
+echo "$VER_JSON" | grep -q "\"version\":\"$SRC_VERSION\"" || fail \
+"the RUNNING module reports a different version than the source declares
+  source says:  $SRC_VERSION
+  module says:  $VER_JSON
+  → either the build is stale, or MOD_AUDIO_FORK_VERSION was not bumped for this release"
+pass "running module reports version $SRC_VERSION (matches source)"
+
+# Every capability bit the source defines as 1 must show up as true, and the
+# ones defined as 0 must show up as false.
+# ★ A bit that lies is worse than a bit that is absent (see mod_audio_fork.h) —
+#   a consumer negotiates on these, so a stale `true` makes it skip a workaround
+#   it still needs.
+for bit in frame_drop_metrics:CAP_FRAME_DROP_METRICS \
+           media_silent:CAP_MEDIA_SILENT \
+           lockfree_writes:CAP_LOCKFREE_WRITES \
+           multithread_safe:CAP_MULTITHREAD_SAFE; do
+    json_name=${bit%%:*}; macro=${bit##*:}
+    src_val=$(sed -n "s/^#define $macro  *\([01]\).*/\1/p" "$REPO_ROOT/mod_audio_fork.h")
+    [ -n "$src_val" ] || fail "could not parse $macro out of mod_audio_fork.h"
+    [ "$src_val" = "1" ] && want=true || want=false
+    echo "$VER_JSON" | grep -q "\"$json_name\":$want" || fail \
+"capability $json_name: source defines $macro=$src_val (=> $want) but the running module disagrees
+  $VER_JSON"
+done
+pass "all capability bits match the source"
 
 EXISTS=$(fs "module_exists mod_audio_fork" | tr -d '[:space:]')
 [ "$EXISTS" = "true" ] || fail "module_exists returned '$EXISTS' (expected 'true') after restart

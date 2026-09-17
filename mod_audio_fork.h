@@ -25,6 +25,10 @@
 #define EVENT_JSON            "mod_audio_fork::json"
 /* PR-2: trylock contention in fork_frame. Throttled — see lws_glue.cpp. */
 #define EVENT_FRAME_DROPPED   "mod_audio_fork::frame_dropped"
+/* The inbound stream is FreeSWITCH's no-media fill, not audio. Throttled.
+ * ⚠ Reserve AND free this in mod_audio_fork.c — see the note next to
+ *   switch_event_free_subclass there. */
+#define EVENT_MEDIA_SILENT    "mod_audio_fork::media_silent"
 
 #define MAX_METADATA_LEN (8192)
 
@@ -59,8 +63,17 @@
  * fail-fast on a too-old module rather than silently assuming:
  *
  *   frame_drop_metrics  mod_audio_fork::frame_dropped is emitted (PR-2)
+ *   media_silent        mod_audio_fork::media_silent is emitted (0.3.0)
  *   lockfree_writes     per-context lock-free write queue (PR-5) — NOT DONE
  *   multithread_safe    SERVICE_THREADS>1 is legal (PR-7)      — NOT DONE
+ *
+ * ★★★ media_silent is why 0.3.0 exists as a release rather than "some commits
+ *   after the tag". The consumer (tanxun-aicc) had to detect no-media calls by
+ *   scanning recorded PCM for all-(-1) samples — 96 recordings by hand — because
+ *   the module knew and did not say. Now it says. A consumer that negotiates on
+ *   this bit can drop the scan; one that cannot see the bit must keep it.
+ *   ⚠ That decision is impossible if the version string does not move, which is
+ *     exactly the state 0.2.0..HEAD was in: five commits, same "0.2.0".
  *
  * ★★ The last two are declared and hard-wired to 0. PR-5/6/7 were dropped from
  *   the roadmap (S2' measured no inflection point at the 10-concurrency target),
@@ -68,8 +81,9 @@
  *   needs to scale up, and deleting them means redesigning this API then.
  *   ⚠ Reporting 0 is the honest answer — a bit that lies is worse than absent.
  */
-#define MOD_AUDIO_FORK_VERSION "0.2.0"
+#define MOD_AUDIO_FORK_VERSION "0.3.0"
 #define CAP_FRAME_DROP_METRICS  1
+#define CAP_MEDIA_SILENT        1
 #define CAP_LOCKFREE_WRITES     0
 #define CAP_MULTITHREAD_SAFE    0
 
@@ -89,9 +103,33 @@ struct private_data {
   int sampling;
   int  channels;
   unsigned int id;
-  int buffer_overrun_notified:1;
-  int audio_paused:1;
-  int graceful_shutdown:1;
+  /* ════════════════════════════════════════════════════════════════════════
+   * ★★★ Three separate ints, deliberately NOT bitfields
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * As `:1` bitfields these three shared one memory location, and they are
+   * written from three different threads:
+   *
+   *   audio_paused        ESL thread   (fork_session_pauseresume)
+   *   graceful_shutdown   ESL thread   (fork_session_graceful_shutdown)
+   *   buffer_overrun_notified  media thread (fork_frame)
+   *
+   * ⚠ Assigning to a bitfield is a read-modify-write of the whole storage unit.
+   *   Two unsynchronised threads touching "different" flags therefore overwrite
+   *   each other — `uuid_audio_fork pause` could be undone by an overrun
+   *   notification landing at the same moment, and nothing would report it.
+   *
+   * ★ Separate ints give each flag its own location, which removes the mutual
+   *   clobbering. It does not make the accesses formally race-free — a fully
+   *   correct version wants atomics — but private_t is a C struct shared with
+   *   mod_audio_fork.c, so _Atomic here would have to be right across the C/C++
+   *   boundary. Saying plainly what this does and does not fix beats a change
+   *   that looks stronger than it is. The three bits cost 12 bytes; the struct
+   *   already carries an 8KB metadata buffer.
+   */
+  int buffer_overrun_notified;
+  int audio_paused;
+  int graceful_shutdown;
   char initialMetadata[8192];
 
   /* Bidirectional audio: server-sent PCM played back to the caller via
@@ -142,6 +180,30 @@ struct private_data {
    *                    throttle needs no clock call on the audio path. */
   uint64_t framesDroppedLock;
   uint64_t lastDropReportedAt;
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * "What we are forwarding is fill, not audio"
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * fillFramesTotal        cumulative frames that were entirely 0xFF
+   * fillFramesConsecutive  the current unbroken run; reset by any real frame
+   * lastFillReportedAt     value of the run length at the previous report
+   * fillReportEvery        run length between reports, in frames
+   *
+   * ★ The report is driven by the CONSECUTIVE run, not the total. A healthy
+   *   call starts with a few fill frames while media comes up (measured: 4
+   *   frames / 80ms on a working trunk call) and may show brief gaps later.
+   *   What is worth an event is "N seconds with nothing at all", and only the
+   *   run length says that.
+   *
+   * ★★ The total still rides along in the payload: after the fact you want to
+   *   know how much of the call was fill, and a consumer that only sees the
+   *   current run cannot reconstruct it.
+   */
+  uint64_t fillFramesTotal;
+  uint64_t fillFramesConsecutive;
+  uint64_t lastFillReportedAt;
+  uint64_t fillReportEvery;
   /* How many skipped frames between reports. Default FRAME_DROP_REPORT_EVERY;
    * override per call with the channel variable
    * MOD_AUDIO_FORK_DROP_REPORT_EVERY.

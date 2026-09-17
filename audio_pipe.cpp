@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -566,7 +567,10 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_sslFlags(sslFlags), m_wsi(nullptr),
   m_audio_buffer_max_len(bufLen), m_audio_buffer_write_offset(LWS_PRE),
   m_audio_buffer_min_freespace(minFreespace),
-  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
+  /* ★ m_recv_buf_len was missing from this list: an uninitialised size next to
+   *   a null pointer. The receive path happens to set it before first use, but
+   *   "happens to" is what the rest of this list exists to avoid. */
+  m_recv_buf(nullptr), m_recv_buf_ptr(nullptr), m_recv_buf_len(0),
   m_vhd(nullptr), m_callback(callback),
   m_gracefulShutdown(false), m_bidirectional_audio_stream(bidirectional_audio_stream) {
 
@@ -578,8 +582,12 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
 }
 AudioPipe::~AudioPipe() {
-  if (m_audio_buffer) delete [] m_audio_buffer;
-  if (m_recv_buf) delete [] m_recv_buf;
+  if (m_audio_buffer) delete [] m_audio_buffer;   /* new uint8_t[] above */
+  /* ★★★ free(), not delete[]. m_recv_buf is malloc'd (LWS_CALLBACK_CLIENT_RECEIVE),
+   *   grown with realloc() and released with free() everywhere else in this file.
+   *   Pairing it with delete[] here is undefined behaviour — it happens not to
+   *   crash on glibc, which is the only reason it has survived. */
+  if (m_recv_buf) free(m_recv_buf);
 }
 
 void AudioPipe::connect(void) {

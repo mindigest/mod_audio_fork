@@ -512,10 +512,30 @@ namespace {
       delete static_cast<PendingMarkQueue*>(tech_pvt->pendingMarks);
       tech_pvt->pendingMarks = nullptr;
     }
-    if (tech_pvt->mutex) {
-      switch_mutex_destroy(tech_pvt->mutex);
-      tech_pvt->mutex = nullptr;
-    }
+    /* ════════════════════════════════════════════════════════════════════
+     * ★★★ The mutex is deliberately NOT destroyed here.
+     * ════════════════════════════════════════════════════════════════════
+     *
+     * It is allocated from the session pool (fork_data_init calls
+     * switch_mutex_init with switch_core_session_get_pool(session)), so APR
+     * reclaims it when the session pool is destroyed. Destroying it here
+     * bought nothing and cost two things:
+     *
+     *  · fork_session_cleanup calls us while HOLDING this very mutex.
+     *    pthread_mutex_destroy on a locked mutex is undefined; on Linux it
+     *    returns EBUSY and silently does nothing, so the bug was invisible —
+     *    it looked like it worked.
+     *
+     *  · the lws service thread can be inside processIncomingBinary /
+     *    processIncomingMessage, blocked on switch_mutex_lock(tech_pvt->mutex),
+     *    at the exact moment we destroy it. Nothing in the current design
+     *    excludes that. ⚠ Letting the pool own the lifetime removes the whole
+     *    class of "destroyed while someone is about to lock it".
+     *
+     * ★ tech_pvt itself is also session-pool allocated (fork_session_init uses
+     *   switch_core_session_alloc), so this is consistent: everything whose
+     *   address the other thread may still hold outlives us.
+     */
   }
 
   void lws_logger(int level, const char *line) {
@@ -658,13 +678,16 @@ extern "C" {
       return SWITCH_STATUS_FALSE;
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+    /* ★ The null check has to come BEFORE the first dereference. It used to sit
+     *   three lines further down, after `uint32_t id = tech_pvt->id;` — so on the
+     *   path it was meant to guard we had already crashed. */
+    if (!tech_pvt) return SWITCH_STATUS_FALSE;
     uint32_t id = tech_pvt->id;
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) fork_session_cleanup\n", id);
 
-    if (!tech_pvt) return SWITCH_STATUS_FALSE;
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
-      
+
     switch_mutex_lock(tech_pvt->mutex);
 
     // get the bug again, now that we are under lock
@@ -680,6 +703,18 @@ extern "C" {
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
+
+    /* ★★★ Unlock BEFORE tearing anything down.
+     *
+     * This function used to lock above and then return without ever unlocking,
+     * while destroy_tech_pvt() destroyed the very mutex we were holding. Both
+     * halves were silent: the missing unlock is invisible once the mutex is
+     * gone, and pthread_mutex_destroy on a held mutex just returns EBUSY.
+     *
+     * ★ Everything the lock protects is done by this point: the bug is detached
+     *   (switch_channel_set_private(.., NULL) above), so no NEW eventCallback
+     *   can reach tech_pvt, and the pipe is closed. */
+    switch_mutex_unlock(tech_pvt->mutex);
 
     destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);

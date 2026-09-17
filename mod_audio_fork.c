@@ -29,6 +29,7 @@ SWITCH_STANDARD_API(fork_version_function)
 		"{\"module\":\"mod_audio_fork\",\"version\":\"%s\","
 		"\"capabilities\":{"
 		"\"frame_drop_metrics\":%s,"
+		"\"media_silent\":%s,"
 		"\"lockfree_writes\":%s,"
 		"\"multithread_safe\":%s"
 		"},"
@@ -36,6 +37,7 @@ SWITCH_STANDARD_API(fork_version_function)
 		"\"subprotocol\":\"%s\"}\n",
 		MOD_AUDIO_FORK_VERSION,
 		CAP_FRAME_DROP_METRICS ? "true" : "false",
+		CAP_MEDIA_SILENT ? "true" : "false",
 		CAP_LOCKFREE_WRITES ? "true" : "false",
 		CAP_MULTITHREAD_SAFE ? "true" : "false",
 		fork_effective_threads(),

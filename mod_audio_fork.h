@@ -63,8 +63,17 @@
  * fail-fast on a too-old module rather than silently assuming:
  *
  *   frame_drop_metrics  mod_audio_fork::frame_dropped is emitted (PR-2)
+ *   media_silent        mod_audio_fork::media_silent is emitted (0.3.0)
  *   lockfree_writes     per-context lock-free write queue (PR-5) — NOT DONE
  *   multithread_safe    SERVICE_THREADS>1 is legal (PR-7)      — NOT DONE
+ *
+ * ★★★ media_silent is why 0.3.0 exists as a release rather than "some commits
+ *   after the tag". The consumer (tanxun-aicc) had to detect no-media calls by
+ *   scanning recorded PCM for all-(-1) samples — 96 recordings by hand — because
+ *   the module knew and did not say. Now it says. A consumer that negotiates on
+ *   this bit can drop the scan; one that cannot see the bit must keep it.
+ *   ⚠ That decision is impossible if the version string does not move, which is
+ *     exactly the state 0.2.0..HEAD was in: five commits, same "0.2.0".
  *
  * ★★ The last two are declared and hard-wired to 0. PR-5/6/7 were dropped from
  *   the roadmap (S2' measured no inflection point at the 10-concurrency target),
@@ -72,8 +81,9 @@
  *   needs to scale up, and deleting them means redesigning this API then.
  *   ⚠ Reporting 0 is the honest answer — a bit that lies is worse than absent.
  */
-#define MOD_AUDIO_FORK_VERSION "0.2.0"
+#define MOD_AUDIO_FORK_VERSION "0.3.0"
 #define CAP_FRAME_DROP_METRICS  1
+#define CAP_MEDIA_SILENT        1
 #define CAP_LOCKFREE_WRITES     0
 #define CAP_MULTITHREAD_SAFE    0
 

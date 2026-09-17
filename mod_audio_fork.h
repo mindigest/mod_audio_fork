@@ -93,9 +93,33 @@ struct private_data {
   int sampling;
   int  channels;
   unsigned int id;
-  int buffer_overrun_notified:1;
-  int audio_paused:1;
-  int graceful_shutdown:1;
+  /* ════════════════════════════════════════════════════════════════════════
+   * ★★★ Three separate ints, deliberately NOT bitfields
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * As `:1` bitfields these three shared one memory location, and they are
+   * written from three different threads:
+   *
+   *   audio_paused        ESL thread   (fork_session_pauseresume)
+   *   graceful_shutdown   ESL thread   (fork_session_graceful_shutdown)
+   *   buffer_overrun_notified  media thread (fork_frame)
+   *
+   * ⚠ Assigning to a bitfield is a read-modify-write of the whole storage unit.
+   *   Two unsynchronised threads touching "different" flags therefore overwrite
+   *   each other — `uuid_audio_fork pause` could be undone by an overrun
+   *   notification landing at the same moment, and nothing would report it.
+   *
+   * ★ Separate ints give each flag its own location, which removes the mutual
+   *   clobbering. It does not make the accesses formally race-free — a fully
+   *   correct version wants atomics — but private_t is a C struct shared with
+   *   mod_audio_fork.c, so _Atomic here would have to be right across the C/C++
+   *   boundary. Saying plainly what this does and does not fix beats a change
+   *   that looks stronger than it is. The three bits cost 12 bytes; the struct
+   *   already carries an 8KB metadata buffer.
+   */
+  int buffer_overrun_notified;
+  int audio_paused;
+  int graceful_shutdown;
   char initialMetadata[8192];
 
   /* Bidirectional audio: server-sent PCM played back to the caller via

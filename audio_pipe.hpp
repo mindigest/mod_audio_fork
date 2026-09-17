@@ -3,6 +3,7 @@
 
 #include <string>
 #include <list>
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <unordered_map>
@@ -53,7 +54,7 @@ public:
     bool bidirectional_audio_stream, notifyHandler_t callback);
   ~AudioPipe();  
 
-  LwsState_t getLwsState(void) { return m_state; }
+  LwsState_t getLwsState(void) { return m_state.load(std::memory_order_acquire); }
   void connect(void);
   void bufferForSending(const char* text);
   size_t binarySpaceAvailable(void) {
@@ -147,7 +148,14 @@ private:
   
   bool connect_client(struct lws_per_vhost_data *vhd);
 
-  LwsState_t m_state;
+  /* ★★★ Written on the lws service thread (connect / established / closed) and
+   *   read on the FreeSWITCH media thread via getLwsState(), which fork_frame
+   *   calls on every 20ms frame. It was a plain enum: a torn or stale read here
+   *   decides whether we write into a pipe that is no longer connected.
+   *   ⚠ Atomic is the floor, not a fix for the check-then-act that follows it —
+   *   fork_frame takes tech_pvt->mutex around that sequence, which is what
+   *   actually makes it safe. */
+  std::atomic<LwsState_t> m_state;
   std::string m_uuid;
   std::string m_host;
   std::string m_bugname;

@@ -328,6 +328,46 @@ namespace {
     switch_mutex_unlock(tech_pvt->mutex);
   }
 
+  /* ════════════════════════════════════════════════════════════════════════
+   * tech_pvt->pAudioPipe must only be touched under tech_pvt->mutex
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * The pointer is written on the **lws service thread** (the three cases in
+   * eventCallback below) and read + dereferenced on the **FreeSWITCH media
+   * thread** (fork_frame). Worse, the object itself is deleted on the lws
+   * thread immediately after the callback returns — audio_pipe.cpp,
+   * LWS_CALLBACK_CLIENT_CLOSED:
+   *
+   *     *ppAp = NULL;
+   *     delete ap;
+   *
+   * ⚠ So the media thread could be holding a pointer that the lws thread is
+   *   about to free: it loads tech_pvt->pAudioPipe, and between that load and
+   *   pAudioPipe->lockAudioBuffer() the object goes away. Use-after-free.
+   *
+   * ★ Nulling the pointer under the same mutex fork_frame uses closes it:
+   *   a media thread that already holds the mutex finishes first, and one that
+   *   acquires it afterwards sees nullptr. Since `delete ap` happens *after*
+   *   m_callback() returns, by then nobody can be inside.
+   *
+   * ★★ Lock order is safe. Everything that takes tech_pvt->mutex may then take
+   *   an AudioPipe-internal lock (m_text_mutex / m_audio_mutex), never the
+   *   reverse: the lws thread releases mutex_connects/writes/disconnects before
+   *   invoking any callback, and AudioPipe::close() / bufferForSending() are
+   *   non-blocking (they only queue and lws_cancel_service). Verified by
+   *   reading every lock site, not by assumption — a blocking close() here
+   *   would deadlock against an lws thread waiting on tech_pvt->mutex.
+   */
+  void clearAudioPipe(private_t* tech_pvt) {
+    if (!tech_pvt || !tech_pvt->mutex) {
+      if (tech_pvt) tech_pvt->pAudioPipe = nullptr;
+      return;
+    }
+    switch_mutex_lock(tech_pvt->mutex);
+    tech_pvt->pAudioPipe = nullptr;
+    switch_mutex_unlock(tech_pvt->mutex);
+  }
+
   static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event,
                             const char* message, const char* binary, size_t binary_len) {
     switch_core_session_t* session = switch_core_session_locate(sessionId);
@@ -343,8 +383,13 @@ namespace {
               tech_pvt->responseHandler(session, EVENT_CONNECT_SUCCESS, NULL);
               if (strlen(tech_pvt->initialMetadata) > 0) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "sending initial metadata %s\n", tech_pvt->initialMetadata);
+                /* ★ Under the mutex, and null-checked. This was an unchecked
+                 *   dereference: on the CONNECT_SUCCESS → (racing) teardown
+                 *   ordering, pAudioPipe can already be nullptr here. */
+                switch_mutex_lock(tech_pvt->mutex);
                 AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
-                pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                if (pAudioPipe) pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                switch_mutex_unlock(tech_pvt->mutex);
               }
             break;
             case AudioPipe::CONNECT_FAIL:
@@ -352,20 +397,20 @@ namespace {
               // first thing: we can no longer access the AudioPipe
               std::stringstream json;
               json << "{\"reason\":\"" << message << "\"}";
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               tech_pvt->responseHandler(session, EVENT_CONNECT_FAIL, (char *) json.str().c_str());
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "connection failed: %s\n", message);
             }
             break;
             case AudioPipe::CONNECTION_DROPPED:
               // first thing: we can no longer access the AudioPipe
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               tech_pvt->responseHandler(session, EVENT_DISCONNECT, NULL);
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "connection dropped from far end\n");
             break;
             case AudioPipe::CONNECTION_CLOSED_GRACEFULLY:
               // first thing: we can no longer access the AudioPipe
-              tech_pvt->pAudioPipe = nullptr;
+              clearAudioPipe(tech_pvt);
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "connection closed gracefully\n");
             break;
             case AudioPipe::MESSAGE:
@@ -665,9 +710,16 @@ extern "C" {
 
    switch_status_t fork_session_connect(void **ppUserData) {
     private_t *tech_pvt = static_cast<private_t *>(*ppUserData);
+    if (!tech_pvt) return SWITCH_STATUS_FALSE;
+    /* ★ Was an unchecked dereference: `static_cast<AudioPipe*>(...)->connect()`
+     *   with no null test at all. It happens to be non-null today because the
+     *   caller runs right after fork_session_init — but "happens to be" is not
+     *   a guarantee, and this is the one place a failed init would land. */
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe*>(tech_pvt->pAudioPipe);
-    pAudioPipe->connect();
-    return SWITCH_STATUS_SUCCESS;
+    if (pAudioPipe) pAudioPipe->connect();
+    switch_mutex_unlock(tech_pvt->mutex);
+    return pAudioPipe ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
   }
 
   switch_status_t fork_session_cleanup(switch_core_session_t *session, char *bugname, char* text, int channelIsClosing) {
@@ -686,9 +738,11 @@ extern "C" {
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) fork_session_cleanup\n", id);
 
-    AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
-
     switch_mutex_lock(tech_pvt->mutex);
+    /* ★ Read INSIDE the lock. This used to sit above the lock, so cleanup could
+     *   load a pointer that the lws thread deleted a moment later — the same
+     *   window fork_frame has, just on a different thread. */
+    AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
 
     // get the bug again, now that we are under lock
     {
@@ -731,8 +785,12 @@ extern "C" {
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
   
     if (!tech_pvt) return SWITCH_STATUS_FALSE;
+    /* ★ Use it under the lock, do not just read it under the lock: the object
+     *   can be deleted on the lws thread the instant we let go. */
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
+    switch_mutex_unlock(tech_pvt->mutex);
 
     return SWITCH_STATUS_SUCCESS;
   }
@@ -780,8 +838,10 @@ extern "C" {
 
     tech_pvt->graceful_shutdown = 1;
 
+    switch_mutex_lock(tech_pvt->mutex);
     AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
     if (pAudioPipe) pAudioPipe->do_graceful_shutdown();
+    switch_mutex_unlock(tech_pvt->mutex);
 
     return SWITCH_STATUS_SUCCESS;
   }

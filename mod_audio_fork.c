@@ -454,6 +454,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
     switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_FRAME_DROPPED) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_MEDIA_SILENT) != SWITCH_STATUS_SUCCESS ||
     /* ════════════════════════════════════════════════════════════════════
      * ★★★ PR-4: these four were DEFINED in the header and never reserved
      * ════════════════════════════════════════════════════════════════════
@@ -514,6 +515,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);
 	switch_event_free_subclass(EVENT_FRAME_DROPPED);
+	switch_event_free_subclass(EVENT_MEDIA_SILENT);
 	/* ★ 必须与 reserve 一一对应：漏 free 的症状是**在同一个进程里 reload 之后
 	 *   load 失败**（"module load file routine returned an error"），而那个报错
 	 *   不提事件子类。⚠ 实测撞到过一次，当时以为是 .so 坏了。 */

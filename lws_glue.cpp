@@ -21,6 +21,7 @@
 #include "mod_audio_fork.h"
 #include "ws_uri.hpp"
 #include "drop_throttle.hpp"
+#include "media_fill.hpp"
 #include "json_escape.hpp"
 #include <inttypes.h>
 
@@ -28,6 +29,11 @@
  *   Counted in frames rather than milliseconds so the audio path needs no
  *   clock syscall — see the else-branch in fork_frame. */
 #define FRAME_DROP_REPORT_EVERY 500
+
+/* ★ How many CONSECUTIVE fill frames before saying so. 250 ≈ 5s at 50 frames/s.
+ *   Short enough to catch a dead call while it is still up, long enough that a
+ *   working call's start-up gap (measured: 4 frames) never trips it. */
+#define MEDIA_FILL_REPORT_EVERY 250
 #include "audio_pipe.hpp"
 
 #define RTP_PACKETIZATION_PERIOD 20
@@ -328,6 +334,53 @@ namespace {
     switch_mutex_unlock(tech_pvt->mutex);
   }
 
+  /* noteFillFrame records one inbound frame and reports a sustained run of
+   * FreeSWITCH no-media fill.
+   *
+   * ★★★ The frame is still forwarded either way. The fill is not wrong — a
+   *   media path must produce a frame every 20ms whether or not anything
+   *   arrived — and dropping it here would turn a diagnosable problem into a
+   *   stream with holes in it. What was missing is the label, so that is all
+   *   this adds. See media_fill.hpp for why the label cannot come from
+   *   FreeSWITCH itself (SFF_CNG is lost on the way into the bug buffer).
+   *
+   * ★ Called on the audio path, so: no clock syscall, no allocation, and the
+   *   throttle counts frames. Same constraints as the PR-2 drop counter, and it
+   *   reuses that counter's arithmetic rather than open-coding a second copy.
+   */
+  void noteFillFrame(switch_core_session_t* session, private_t* tech_pvt, int isFill) {
+    if (!tech_pvt) return;
+    if (!isFill) {
+      /* ★ Reset the report marker too, not just the run. Otherwise a second
+       *   outage in the same call stays silent until it exceeds the first. */
+      tech_pvt->fillFramesConsecutive = 0;
+      tech_pvt->lastFillReportedAt = 0;
+      return;
+    }
+    tech_pvt->fillFramesTotal++;
+    tech_pvt->fillFramesConsecutive++;
+    if (!mod_af_should_report_drop(tech_pvt->fillFramesConsecutive,
+                                   tech_pvt->lastFillReportedAt,
+                                   tech_pvt->fillReportEvery,
+                                   MEDIA_FILL_REPORT_EVERY)) {
+      return;
+    }
+    tech_pvt->lastFillReportedAt = tech_pvt->fillFramesConsecutive;
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+      "{\"consecutive_fill_frames\":%" PRIu64 ",\"consecutive_ms\":%" PRIu64
+      ",\"total_fill_frames\":%" PRIu64 "}",
+      tech_pvt->fillFramesConsecutive,
+      tech_pvt->fillFramesConsecutive * RTP_PACKETIZATION_PERIOD,
+      tech_pvt->fillFramesTotal);
+    tech_pvt->responseHandler(session, EVENT_MEDIA_SILENT, buf);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+      "(%u) mod_audio_fork: inbound is FreeSWITCH no-media fill, not audio "
+      "(%" PRIu64 " consecutive frames = %" PRIu64 "ms)\n",
+      tech_pvt->id, tech_pvt->fillFramesConsecutive,
+      tech_pvt->fillFramesConsecutive * RTP_PACKETIZATION_PERIOD);
+  }
+
   /* ════════════════════════════════════════════════════════════════════════
    * tech_pvt->pAudioPipe must only be touched under tech_pvt->mutex
    * ════════════════════════════════════════════════════════════════════════
@@ -466,6 +519,17 @@ namespace {
         if (n > 0) tech_pvt->dropReportEvery = (uint64_t) n;
         else switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
           "MOD_AUDIO_FORK_DROP_REPORT_EVERY=%s ignored (must be > 0)\n", v);
+      }
+    }
+    tech_pvt->fillReportEvery = MEDIA_FILL_REPORT_EVERY;
+    {
+      const char *v = switch_channel_get_variable(
+        switch_core_session_get_channel(session), "MOD_AUDIO_FORK_FILL_REPORT_EVERY");
+      if (v) {
+        long n = atol(v);
+        if (n > 0) tech_pvt->fillReportEvery = (uint64_t) n;
+        else switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+          "MOD_AUDIO_FORK_FILL_REPORT_EVERY=%s ignored (must be > 0)\n", v);
       }
     }
     tech_pvt->audio_paused = 0;
@@ -888,6 +952,9 @@ extern "C" {
           switch_status_t rv = switch_core_media_bug_read(bug, &frame, SWITCH_TRUE);
           if (rv != SWITCH_STATUS_SUCCESS) break;
           if (frame.datalen) {
+            /* ★ Inspect BEFORE binaryWritePtrAdd: frame.data still points at the
+             *   bytes we just read, and after the add the pointer has moved on. */
+            noteFillFrame(session, tech_pvt, mod_af_frame_is_fill(frame.data, frame.datalen));
             pAudioPipe->binaryWritePtrAdd(frame.datalen);
             frame.buflen = available = pAudioPipe->binarySpaceAvailable();
             frame.data = pAudioPipe->binaryWritePtr();
@@ -902,6 +969,9 @@ extern "C" {
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
           if (frame.datalen) {
+            /* ★ Judge the frame as it arrived, before resampling: the resampler
+             *   would smear 0xFF into values that are merely close to it. */
+            noteFillFrame(session, tech_pvt, mod_af_frame_is_fill(frame.data, frame.datalen));
             spx_uint32_t out_len = available >> 1;  // space for samples which are 2 bytes
             spx_uint32_t in_len = frame.samples;
 

@@ -106,6 +106,12 @@ add_executable(json_escape_test tests/json_escape_test.cpp)
 target_include_directories(json_escape_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(json_escape_test PRIVATE -Wall -Wextra)
 
+# media_fill.hpp is header-only. ★ This is the first test in the suite that
+# touches the read path at all — see tests/media_fill_test.cpp.
+add_executable(media_fill_test tests/media_fill_test.cpp)
+target_include_directories(media_fill_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(media_fill_test PRIVATE -Wall -Wextra)
+
 set(FREESWITCH_MOD_DIR "/usr/local/freeswitch/mod"
     CACHE PATH "FreeSWITCH module install directory")
 

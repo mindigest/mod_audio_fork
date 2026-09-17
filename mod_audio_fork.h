@@ -25,6 +25,10 @@
 #define EVENT_JSON            "mod_audio_fork::json"
 /* PR-2: trylock contention in fork_frame. Throttled — see lws_glue.cpp. */
 #define EVENT_FRAME_DROPPED   "mod_audio_fork::frame_dropped"
+/* The inbound stream is FreeSWITCH's no-media fill, not audio. Throttled.
+ * ⚠ Reserve AND free this in mod_audio_fork.c — see the note next to
+ *   switch_event_free_subclass there. */
+#define EVENT_MEDIA_SILENT    "mod_audio_fork::media_silent"
 
 #define MAX_METADATA_LEN (8192)
 
@@ -142,6 +146,30 @@ struct private_data {
    *                    throttle needs no clock call on the audio path. */
   uint64_t framesDroppedLock;
   uint64_t lastDropReportedAt;
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * "What we are forwarding is fill, not audio"
+   * ════════════════════════════════════════════════════════════════════════
+   *
+   * fillFramesTotal        cumulative frames that were entirely 0xFF
+   * fillFramesConsecutive  the current unbroken run; reset by any real frame
+   * lastFillReportedAt     value of the run length at the previous report
+   * fillReportEvery        run length between reports, in frames
+   *
+   * ★ The report is driven by the CONSECUTIVE run, not the total. A healthy
+   *   call starts with a few fill frames while media comes up (measured: 4
+   *   frames / 80ms on a working trunk call) and may show brief gaps later.
+   *   What is worth an event is "N seconds with nothing at all", and only the
+   *   run length says that.
+   *
+   * ★★ The total still rides along in the payload: after the fact you want to
+   *   know how much of the call was fill, and a consumer that only sees the
+   *   current run cannot reconstruct it.
+   */
+  uint64_t fillFramesTotal;
+  uint64_t fillFramesConsecutive;
+  uint64_t lastFillReportedAt;
+  uint64_t fillReportEvery;
   /* How many skipped frames between reports. Default FRAME_DROP_REPORT_EVERY;
    * override per call with the channel variable
    * MOD_AUDIO_FORK_DROP_REPORT_EVERY.
